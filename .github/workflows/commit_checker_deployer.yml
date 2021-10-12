@@ -1,0 +1,163 @@
+name: GitHub Commit Checker Deployer
+
+on:
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'commit_checker/**'
+
+jobs:
+  commit_checker_deploy:
+    runs-on: [self-hosted]
+    
+    # Set global env variables for job
+    env:
+      working_directory: .
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Create PRs on all repos
+      # Run only when main branch is merged, via direct commit or PR merge
+      if: ${{ github.ref == 'refs/heads/main' }}
+      working-directory: ${{ env.working_directory }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.ENV_GITHUB_TOKEN }}
+      # GHA by default runs with -e set, exiting on any error, which isn't ideal
+      shell: /bin/bash -e {0}
+      run: |
+        # Set new line as separator for reading data in for loops
+        IFS=$'\n'
+        
+        # Pull repo to get updated metadata
+        git pull origin main
+        git checkout main
+
+        # ******
+        # Set vars
+        # ******
+        org=org_name_in_github
+        repo=name_of_repo_where_script_running_from
+        
+        # Pull commit message from merge commit into master
+        commit_message_spaces=$(git log -n 1 --pretty="%b" | cut -d "/" -f 2-)
+        commit_message="${commit_message_spaces// /-}"
+        
+        # Since this runs right after merge, use last commit message to contribute new branch name
+        branch=$(git log -n 1 --pretty="%B" | grep "Merge pull request" | cut -d "/" -f 2-)
+        
+        # PR body
+        pr_body="Updating the commit checker due to a merge at this repo: https://github.com/$org/$repoo"
+        
+        # Program git defaults
+        git config --global user.email "commit-checker-bot@yourCompany.com"
+        git config --global user.name "GithubAutomation YACC Deploy Bot"
+        
+        # List all repos, cut for just repo name in org
+        org_repos=$(gh repo list $org -L 1000 | cut -d "/" -f 2 | cut -f 1)
+        
+        #TEMP: testing with individual repo
+        #org_repos=KylerTestRepo1
+        # Iterate over each repo
+        for repo in $org_repos; do
+            echo "********"
+            echo "** Cloning repo" $repo "to update Action"
+            
+            # Create landing space to avoid name collission with this repo
+            mkdir -p /tmp
+            cd /tmp
+            # Clone the repo, move into it
+            gitCloneResults=$(git clone https://oauth2:$GITHUB_TOKEN@github.com/$org/$repo.git 2>&1)
+            # If cloned repo is empty, initialilze main branch
+            initRepo=
+            if echo "$gitCloneResults" | grep -q "You appear to have cloned an empty repository"; then
+              echo "Empty repo detected, initializing main branch"
+              initRepo=true
+              cd $repo
+              git init
+              git checkout -b main
+              git commit --allow-empty -m "TICKET-12345 Initialize repo"
+              # Attempt git push, check for archived to safely catch
+              gitPushResults=
+              gitPushResults=$(git push --force --set-upstream origin main 2>&1 || true)
+              # Check if failed to push due to archived read-only
+              if echo "$gitPushResults" | grep -q "This repository was archived"; then
+                echo "This repository is archived, and is read-only, skipping"
+                # Cleanup
+                cd ../
+                rm -rf $repo
+                # Continue to next loop
+                continue
+              elif echo "$gitPushResults" | grep -q "already exists"; then
+                echo "Pull request already exists with this name, skipping"
+                # Cleanup
+                cd ../
+                rm -rf $repo
+                # Continue to next loop
+                continue
+              fi
+            else
+              # Repo cloned successfully
+              cd $repo
+            fi
+            
+            # Add idempotence circuit breaker by checking md5 of old vs new file
+            newFileMd5=$(md5sum ../../actions-runner/_work/$repo/$repo/commit_checker/github_commit_checker.yml.template 2>/dev/null | cut -d " " -f 1)
+            existingFileMd5=$(md5sum .github/workflows/GitCommitChecker.yml 2>/dev/null | cut -d " " -f 1)
+            # If md5 match, continue to next iteration of loop
+            if [[ $newFileMd5 == $existingFileMd5 ]]; then
+              echo "Actions file has not changed, continuing to next iteration of loop"
+              continue
+            else
+              echo "Actions file is missing or has changed, attempting to open new PR"
+            fi
+            # Create workflows directory if not exist, copy source over existig
+            mkdir -p .github/workflows
+            cp ../../actions-runner/_work/TfGithubAutomation/TfGithubAutomation/commit_checker/github_commit_checker.yml.template .github/workflows/GitCommitChecker.yml
+            # Checkout new branch
+            git checkout -b $branch
+            # Add file, commit
+            git add .
+            git commit -m $commit_message
+            # Identify base/main branch
+            if [[ "$initRepo" == "true" ]]; then
+              base_branch=master
+            else
+              base_branch=$(git symbolic-ref refs/remotes/origin/HEAD | cut -d "/" -f 4)
+            fi
+            
+            # Attempt push, open PR
+            gitPushResults=
+            gitPushResults=$(git push origin $branch --force 2>&1 || true)
+            
+            # Check if failed to push due to archived read-only
+            if echo "$gitPushResults" | grep -q "This repository was archived"; then
+              echo "This repository is archived, and is read-only, skipping"
+              # Cleanup
+              cd ../
+              rm -rf $repo
+              # Continue to next loop
+              continue
+            elif echo "$gitPushResults" | grep -q "already exists"; then
+              echo "Pull request already exists with this name, skipping"
+              # Cleanup
+              cd ../
+              rm -rf $repo
+              # Continue to next loop
+              continue
+            else
+              # Normal rules apply, creating PR
+              gh pr create -b $pr_body -t $commit_message -B $base_branch || true
+            fi
+            # Cleanup files
+            cd ../
+            rm -rf $repo
+            # Sleep to avoid github API rate-limits
+            echo "sleeping for 5 seconds"
+            echo "********"
+            sleep 5
+            
+        done
